@@ -27,5 +27,6 @@ if [ -f "$CONFIG_FILE" ]; then
     echo "Removing configuration file ($CONFIG_FILE)..."
     rm -f "$CONFIG_FILE"
 fi
-
+cd ..
+sudo rm -rf autodnsip-main
 echo "Uninstallation complete."
