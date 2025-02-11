@@ -1,220 +1,92 @@
-#!/usr/bin/env python3
-import requests
-import json
-import os
+#!/bin/bash
+set -e
 
-# Import configuration values from config.py
-import config
+echo "Welcome to the NPM Proxy & Cloudflare DNS Update Service Installer."
+echo "Please provide the following configuration values."
 
-NPM_API_URL = config.NPM_API_URL
-NPM_API_USER = config.NPM_API_USER
-NPM_API_PASS = config.NPM_API_PASS
-# CLOUDFLARE_CONFIG is a dict mapping a root domain (e.g. "hung99.com") to its Cloudflare credentials.
-CLOUDFLARE_CONFIG = config.CLOUDFLARE_CONFIG
+# Prompt for NPM API configuration
+read -p "Enter NPM API URL (default: http://127.0.0.1): " NPM_API_URL
+NPM_API_URL=${NPM_API_URL:-"http://127.0.0.1"}
 
-def get_npm_token():
-    """Gets an API token from NPM."""
-    url = f"{NPM_API_URL}/api/tokens"
-    data = {"identity": NPM_API_USER, "secret": NPM_API_PASS}
-    response = requests.post(url, json=data)
-    response.raise_for_status()
-    return response.json()['token']
+read -p "Enter NPM API user: " NPM_API_USER
+read -p "Enter NPM API password: " NPM_API_PASS
 
-def get_proxy_hosts(token):
-    """Gets the list of proxy hosts from NPM."""
-    url = f"{NPM_API_URL}/api/nginx/proxy-hosts"
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    return response.json()
+# Prompt for how many domains to control
+read -p "How many domains do you want to control? " domain_count
 
-def update_host_file(current_hosts, filename):
-    """Writes the current hosts into the file."""
-    with open(filename, "w") as f:
-        for host in current_hosts:
-            f.write(host + "\n")
+cf_config_entries=""
+for (( i=1; i<=domain_count; i++ ))
+do
+    echo "Enter Cloudflare credentials for domain #$i:"
+    read -p "  Root Domain (e.g., example.com): " root_domain
+    read -p "  API Token: " cf_token
+    read -p "  Zone ID: " zone_id
 
-def get_public_ip():
-    """Fetches the public IP of this server."""
-    try:
-        response = requests.get("https://api.ipify.org?format=json")
-        response.raise_for_status()
-        return response.json()["ip"]
-    except Exception as e:
-        print("Error retrieving public IP:", e)
-        return None
+    if [ $i -eq 1 ]; then
+        cf_config_entries="\"$root_domain\": {\"API_TOKEN\": \"$cf_token\", \"ZONE_ID\": \"$zone_id\"}"
+    else
+        cf_config_entries+=",\n    \"$root_domain\": {\"API_TOKEN\": \"$cf_token\", \"ZONE_ID\": \"$zone_id\"}"
+    fi
+done
 
-def get_cf_config_for_domain(domain):
-    """
-    Determines the root domain for the given proxy host and returns the corresponding
-    Cloudflare configuration. If the domain isn't configured, it returns None.
-    """
-    for root in CLOUDFLARE_CONFIG:
-        if domain.endswith(root):
-            return CLOUDFLARE_CONFIG[root]
-    print(f"Skipping domain {domain}: No Cloudflare configuration found.")
-    return None
+echo "Saving configuration to config.py..."
+cat > config.py <<EOF
+# Auto-generated configuration file
 
-def check_cloudflare_record_exists(domain, cf_config):
-    """Checks if an A record already exists for the given domain in Cloudflare."""
-    url = f"https://api.cloudflare.com/client/v4/zones/{cf_config['ZONE_ID']}/dns_records"
-    params = {"type": "A", "name": domain}
-    headers = {"Authorization": f"Bearer {cf_config['API_TOKEN']}"}
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    results = response.json().get('result', [])
-    return len(results) > 0
+NPM_API_URL = "${NPM_API_URL}"
+NPM_API_USER = "${NPM_API_USER}"
+NPM_API_PASS = "${NPM_API_PASS}"
+CLOUDFLARE_CONFIG = {
+    ${cf_config_entries}
+}
+EOF
 
-def create_cloudflare_a_record(domain, ip, cf_config):
-    """Creates an A record in Cloudflare for the given domain with the provided IP."""
-    if check_cloudflare_record_exists(domain, cf_config):
-        print(f"A record already exists for {domain}, checking for update.")
-        update_cloudflare_a_record(domain, ip, cf_config)
-        return
+echo "Configuration saved."
 
-    url = f"https://api.cloudflare.com/client/v4/zones/{cf_config['ZONE_ID']}/dns_records"
-    headers = {
-        "Authorization": f"Bearer {cf_config['API_TOKEN']}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "type": "A",
-        "name": domain,
-        "content": ip,
-        "ttl": 3600,
-        "proxied": True
-    }
-    response = requests.post(url, headers=headers, json=data)
-    try:
-        response.raise_for_status()
-        print(f"A record created for {domain} with IP {ip}")
-    except requests.exceptions.HTTPError:
-        error_detail = response.json()
-        print(f"Error creating Cloudflare A record for {domain}: {response.status_code} {response.reason}")
-        print("Details:", error_detail)
+# Create a systemd service file template
+SERVICE_FILE="ddns.service"
+echo "Creating systemd service file..."
 
-def update_cloudflare_a_record(domain, new_ip, cf_config):
-    """Updates the A record in Cloudflare for the given domain with the new IP if it differs."""
-    url = f"https://api.cloudflare.com/client/v4/zones/{cf_config['ZONE_ID']}/dns_records"
-    params = {"type": "A", "name": domain}
-    headers = {"Authorization": f"Bearer {cf_config['API_TOKEN']}", "Content-Type": "application/json"}
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    results = response.json().get('result', [])
-    if not results:
-        print(f"No A record found for {domain} to update, creating one.")
-        create_cloudflare_a_record(domain, new_ip, cf_config)
-        return
-    for record in results:
-        if record.get('content') != new_ip:
-            record_id = record.get('id')
-            update_url = f"https://api.cloudflare.com/client/v4/zones/{cf_config['ZONE_ID']}/dns_records/{record_id}"
-            data = {
-                "type": "A",
-                "name": domain,
-                "content": new_ip,
-                "ttl": 3600,
-                "proxied": True
-            }
-            update_response = requests.put(update_url, headers=headers, json=data)
-            try:
-                update_response.raise_for_status()
-                print(f"A record updated for {domain} to IP {new_ip}")
-            except requests.exceptions.HTTPError:
-                error_detail = update_response.json()
-                print(f"Error updating Cloudflare A record for {domain}: {update_response.status_code} {update_response.reason}")
-                print("Details:", error_detail)
-        else:
-            print(f"A record for {domain} already has the correct IP {new_ip}")
+cat > ${SERVICE_FILE} <<EOF
+[Unit]
+Description=Update NPM Proxy Hosts and Cloudflare DNS A Records
+After=network.target
 
-def delete_cloudflare_a_record(domain, cf_config):
-    """Deletes an A record in Cloudflare for the given domain."""
-    url = f"https://api.cloudflare.com/client/v4/zones/{cf_config['ZONE_ID']}/dns_records"
-    params = {"type": "A", "name": domain}
-    headers = {"Authorization": f"Bearer {cf_config['API_TOKEN']}"}
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    results = response.json().get('result', [])
-    if not results:
-        print(f"No A record found for {domain}")
-        return
-    for record in results:
-        record_id = record.get('id')
-        del_url = f"https://api.cloudflare.com/client/v4/zones/{cf_config['ZONE_ID']}/dns_records/{record_id}"
-        del_response = requests.delete(del_url, headers=headers)
-        try:
-            del_response.raise_for_status()
-            print(f"A record deleted for {domain}")
-        except requests.exceptions.HTTPError:
-            error_detail = del_response.json()
-            print(f"Error deleting Cloudflare A record for {domain}: {del_response.status_code} {del_response.reason}")
-            print("Details:", error_detail)
+[Service]
+Type=oneshot
+User=$(whoami)
+WorkingDirectory=$(pwd)
+ExecStart=/usr/bin/python3 $(pwd)/autodnsip.py
 
-if __name__ == "__main__":
-    token = get_npm_token()
-    proxy_hosts = get_proxy_hosts(token)
-    current_domains = {domain for host in proxy_hosts for domain in host['domain_names']}
+[Install]
+WantedBy=multi-user.target
+EOF
 
-    # File to track previous domains (for detecting created/deleted hosts)
-    hosts_filename = "proxy_hosts.txt"
-    if os.path.exists(hosts_filename):
-        with open(hosts_filename, "r") as f:
-            previous_domains = {line.strip() for line in f if line.strip()}
-    else:
-        previous_domains = set()
+# Create a systemd timer file to run the service every 5 seconds
+TIMER_FILE="ddns.timer"
+echo "Creating systemd timer file..."
 
-    created_domains = current_domains - previous_domains
-    deleted_domains = previous_domains - current_domains
+cat > ${TIMER_FILE} <<EOF
+[Unit]
+Description=Run NPM Proxy Update every 5 seconds
 
-    # Load stored domain IP mappings from file
-    domain_ips_file = "domain_ips.json"
-    try:
-        with open(domain_ips_file, "r") as f:
-            stored_ips = json.load(f)
-    except Exception:
-        stored_ips = {}
+[Timer]
+OnBootSec=5sec
+OnUnitActiveSec=5sec
+AccuracySec=1sec
+Unit=ddns.service
 
-    current_public_ip = get_public_ip()
-    if not current_public_ip:
-        print("Could not retrieve public IP, aborting update.")
-        exit(1)
+[Install]
+WantedBy=timers.target
+EOF
 
-    # Process each current domain individually, skipping those not configured
-    for domain in current_domains:
-        cf_config = get_cf_config_for_domain(domain)
-        if cf_config is None:
-            continue
-        if domain in stored_ips:
-            if stored_ips[domain] != current_public_ip:
-                print(f"Public IP for {domain} changed: {stored_ips[domain]} -> {current_public_ip}")
-                try:
-                    update_cloudflare_a_record(domain, current_public_ip, cf_config)
-                    stored_ips[domain] = current_public_ip
-                except Exception as e:
-                    print(f"Error updating Cloudflare A record for {domain}: {e}")
-            else:
-                print(f"Public IP for {domain} unchanged ({current_public_ip}).")
-        else:
-            print(f"New domain detected: {domain}. Creating A record with IP {current_public_ip}")
-            try:
-                create_cloudflare_a_record(domain, current_public_ip, cf_config)
-                stored_ips[domain] = current_public_ip
-            except Exception as e:
-                print(f"Error processing Cloudflare creation for {domain}: {e}")
+echo "Installing systemd service and timer..."
+sudo cp ${SERVICE_FILE} /etc/systemd/system/
+sudo cp ${TIMER_FILE} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable ddns.timer
+sudo systemctl start ddns.timer
 
-    # Process deleted domains (only for domains that were configured)
-    for domain in deleted_domains:
-        cf_config = get_cf_config_for_domain(domain)
-        if cf_config is None:
-            continue
-        try:
-            delete_cloudflare_a_record(domain, cf_config)
-        except Exception as e:
-            print(f"Error processing Cloudflare deletion for {domain}: {e}")
-        if domain in stored_ips:
-            del stored_ips[domain]
-
-    with open(domain_ips_file, "w") as f:
-        json.dump(stored_ips, f)
-
-    update_host_file(current_domains, hosts_filename)
+echo "Installation complete. The service is scheduled to run every 5 seconds via systemd timer."
+echo "Run command \"systemctl status ddns.service\" to see service status."
+echo "Run command \"sudo journalctl -u ddns.service -f\" to see service log."
